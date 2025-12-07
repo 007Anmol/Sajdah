@@ -1,134 +1,247 @@
-# backend/main.py
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-import io
-import uuid
-import asyncio
 import os
 from pathlib import Path
-import tempfile
+from tkinter import Tk, filedialog, ttk, messagebox, simpledialog
+from pypdf import PdfReader, PdfWriter, Transformation
+from pypdf.generic import RectangleObject
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from PIL import Image
+import io
 
-app = FastAPI(title="PDF Master Pro API")
+class SimplePDFEditor:
+    def __init__(self):
+        self.root = Tk()
+        self.root.title("Simple PDF Editor")
+        self.root.geometry("600x500")
+        
+        ttk.Label(self.root, text="Simple PDF Editor", font=("Helvetica", 18, "bold")).pack(pady=20)
+        
+        buttons = [
+            ("Merge PDFs", self.merge_pdfs),
+            ("Split PDF", self.split_pdf),
+            ("Rotate Pages", self.rotate_pages),
+            ("Delete Pages", self.delete_pages),
+            ("Add Watermark", self.add_watermark),
+            ("Add Page Numbers", self.add_page_numbers),
+            ("Extract Text", self.extract_text),
+            ("Extract Images", self.extract_images),
+        ]
+        
+        for text, command in buttons:
+            ttk.Button(self.root, text=text, command=command).pack(pady=8, fill="x", padx=50)
+        
+        self.root.mainloop()
 
-# Allow Vercel frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Change to your Vercel URL in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    def select_files(self, title="Select PDF files", multiple=False):
+        filetypes = [("PDF files", "*.pdf")]
+        if multiple:
+            return filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        else:
+            return filedialog.askopenfilename(title=title, filetypes=filetypes)
 
-# Temp directory (auto-cleans on reboot + we clean faster)
-TEMP_DIR = Path(tempfile.gettempdir()) / "pdf-master-pro"
-TEMP_DIR.mkdir(exist_ok=True)
+    def select_save_file(self, title="Save as", defaultextension=".pdf"):
+        return filedialog.asksaveasfilename(title=title, defaultextension=defaultextension)
 
-# Background cleanup every 5 minutes
-async def cleanup_temp():
-    while True:
-        await asyncio.sleep(300)
-        now = asyncio.get_event_loop().time()
-        for file in TEMP_DIR.iterdir():
-            try:
-                if now - file.stat().st_atime > 600:  # 10 min old
-                    file.unlink(missing_ok=True)
-            except:
-                pass
+    # 1. Merge PDFs
+    def merge_pdfs(self):
+        files = self.select_files("Select PDFs to merge", multiple=True)
+        if not files:
+            return
+        output_path = self.select_save_file("Save merged PDF")
+        if not output_path:
+            return
+            
+        merger = PdfWriter()
+        for f in files:
+            merger.append(f)
+        merger.write(output_path)
+        merger.close()
+        messagebox.showinfo("Success", f"Merged PDF saved to:\n{output_path}")
 
-@app.on_event("startup")
-async def start_cleanup():
-    asyncio.create_task(cleanup_temp())
+    # 2. Split PDF
+    def split_pdf(self):
+        file = self.select_files("Select PDF to split")
+        if not file:
+            return
+        folder = filedialog.askdirectory(title="Select folder to save pages")
+        if not folder:
+            return
+            
+        reader = PdfReader(file)
+        for i, page in enumerate(reader.pages, 1):
+            writer = PdfWriter()
+            writer.add_page(page)
+            output_path = Path(folder) / f"page_{i}.pdf"
+            writer.write(str(output_path))
+        messagebox.showinfo("Success", f"Split into {len(reader.pages)} files in:\n{folder}")
 
-def temp_path(suffix=""):
-    return TEMP_DIR / f"{uuid.uuid4()}{suffix}"
-
-# 1. Merge PDFs
-@app.post("/merge")
-async def merge_pdfs(files: list[UploadFile] = File(...)):
-    if len(files) < 2:
-        raise HTTPException(400, "Need at least 2 PDFs")
-
-    writer = PdfWriter()
-    paths = []
-
-    try:
-        for file in files:
-            path = temp_path(f"_{file.filename}")
-            paths.append(path)
-            content = await file.read()
-            path.write_bytes(content)
-            writer.append(path)
-
-        output = temp_path("_merged.pdf")
-        output.write_bytes(writer.write()[1])  # pypdf returns (stream, metadata)
-
-        def stream():
-            try:
-                yield from open(output, "rb")
-            finally:
-                for p in paths + [output]:
-                    try: p.unlink(missing_ok=True)
-                    except: pass
-
-        return StreamingResponse(stream(), media_type="application/pdf",
-                                 headers={"Content-Disposition": "attachment; filename=merged.pdf"})
-    except:
-        for p in paths:
-            p.unlink(missing_ok=True)
-        raise HTTPException(500, "Merge failed")
-
-# 2. Add Watermark
-@app.post("/watermark")
-async def add_watermark(file: UploadFile = File(...), text: str = Form(...)):
-    if not text.strip():
-        raise HTTPException(400, "Text required")
-
-    input_path = temp_path(f"_{file.filename}")
-    output_path = temp_path("_watermarked.pdf")
-
-    try:
-        content = await file.read()
-        input_path.write_bytes(content)
-
-        reader = PdfReader(input_path)
+    # 3. Rotate pages
+    def rotate_pages(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+        pages_str = simpledialog.askstring("Pages", "Enter page numbers (e.g., 1,3-5) or 'all':")
+        if not pages_str:
+            return
+        angle = simpledialog.askinteger("Rotation", "Rotate by degrees (90, 180, 270):", minvalue=90, maxvalue=270)
+        if not angle:
+            return
+            
+        reader = PdfReader(file)
         writer = PdfWriter()
+        
+        pages_to_rotate = self.parse_pages(pages_str, len(reader.pages))
+        
+        for i, page in enumerate(reader.pages):
+            if (i + 1) in pages_to_rotate or pages_str.strip().lower() == "all":
+                page.rotate(angle)
+            writer.add_page(page)
+            
+        output = self.select_save_file()
+        if output:
+            writer.write(output)
+            messagebox.showinfo("Done", "Pages rotated!")
 
+    # 4. Delete pages
+    def delete_pages(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+        pages_str = simpledialog.askstring("Delete", "Enter page numbers to delete (e.g., 2,5-7):")
+        if not pages_str:
+            return
+            
+        reader = PdfReader(file)
+        writer = PdfWriter()
+        pages_to_delete = self.parse_pages(pages_str, len(reader.pages))
+        
+        for i, page in enumerate(reader.pages):
+            if (i + 1) not in pages_to_delete:
+                writer.add_page(page)
+                
+        output = self.select_save_file()
+        if output:
+            writer.write(output)
+            messagebox.showinfo("Done", "Pages deleted!")
+
+    # 5. Add watermark (text)
+    def add_watermark(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+        text = simpledialog.askstring("Watermark", "Enter watermark text:")
+        if not text:
+            return
+            
+        reader = PdfReader(file)
+        writer = PdfWriter()
+        
+        # Create watermark PDF
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont("Helvetica-Bold", 80)
-        can.setFillAlpha(0.25)
-        can.setFillColorRGB(0.9, 0.1, 0.1)
+        width, height = letter
+        can.setFont("Helvetica", 50)
+        can.setFillAlpha(0.3)
         can.rotate(45)
-        can.drawCentredString(600, 100, text.upper())
+        can.drawCentredString(width/2, height/2 - 100, text)
         can.save()
         packet.seek(0)
-        watermark = PdfReader(packet).pages[0]
-
+        watermark = PdfReader(packet)
+        watermark_page = watermark.pages[0]
+        
         for page in reader.pages:
-            page.merge_page(watermark)
+            page.merge_page(watermark_page)
             writer.add_page(page)
+            
+        output = self.select_save_file()
+        if output:
+            writer.write(output)
+            messagebox.showinfo("Done", "Watermark added!")
 
-        output_path.write_bytes(writer.write()[1])
+    # 6. Add page numbers
+    def add_page_numbers(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+            
+        reader = PdfReader(file)
+        writer = PdfWriter()
+        
+        for i, page in enumerate(reader.pages):
+            packet = io.BytesIO()
+            can = canvas.Canvas(packet, pagesize=page.mediabox.lower_right)
+            width, height = page.mediabox.width, page.mediabox.height
+            can.drawString(width - 100, 20, f"Page {i+1}")
+            can.save()
+            packet.seek(0)
+            overlay = PdfReader(packet).pages[0]
+            page.merge_page(overlay)
+            writer.add_page(page)
+            
+        output = self.select_save_file()
+        if output:
+            writer.write(output)
+            messagebox.showinfo("Done", "Page numbers added!")
 
-        def stream():
-            try:
-                yield from open(output_path, "rb")
-            finally:
-                input_path.unlink(missing_ok=True)
-                output_path.unlink(missing_ok=True)
+    # 7. Extract text
+    def extract_text(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+        reader = PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n\n"
+            
+        save_path = self.select_save_file("Save text as", ".txt")
+        if save_path:
+            Path(save_path).write_text(text, encoding="utf-8")
+            messagebox.showinfo("Done", f"Text saved to {save_path}")
 
-        return StreamingResponse(stream(), media_type="application/pdf",
-                                 headers={"Content-Disposition": f"attachment; filename=watermarked_{text}.pdf"})
-    except:
-        input_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        raise HTTPException(500, "Watermark failed")
+    # 8. Extract images
+    def extract_images(self):
+        file = self.select_files("Select PDF")
+        if not file:
+            return
+        folder = filedialog.askdirectory(title="Save images to")
+        if not folder:
+            return
+            
+        reader = PdfReader(file)
+        count = 0
+        for page_num, page in enumerate(reader.pages, 1):
+            if "/XObject" in page["/Resources"]:
+                xObject = page["/Resources"]["/XObject"].get_object()
+                for obj in xObject:
+                    if xObject[obj]["/Subtype"] == "/Image":
+                        size = (xObject[obj]["/Width"], xObject[obj]["/Height"])
+                        data = xObject[obj].get_data()
+                        if "/Filter" in xObject[obj]:
+                            if xObject[obj]["/Filter"] == "/DCTDecode":
+                                ext = ".jpg"
+                            elif xObject[obj]["/Filter"] == "/JPXDecode":
+                                ext = ".jp2"
+                            else:
+                                ext = ".png"
+                        else:
+                            ext = ".png"
+                        
+                        img = Image.open(io.BytesIO(data))
+                        path = Path(folder) / f"page{page_num}_img{count}{ext}"
+                        img.save(str(path))
+                        count += 1
+        messagebox.showinfo("Done", f"Extracted {count} images")
 
-# Health check
-@app.get("/")
-def home():
-    return {"status": "PDF Master Pro API Running", "files_in_temp": len(list(TEMP_DIR.iterdir()))}
+    def parse_pages(self, pages_str, total_pages):
+        pages = set()
+        for part in pages_str.replace(" ", "").split(","):
+            if "-" in part:
+                start, end = map(int, part.split("-"))
+                pages.update(range(start, end + 1))
+            else:
+                pages.add(int(part))
+        return {p for p in pages if 1 <= p <= total_pages}
+
+if __name__ == "__main__":
+    SimplePDFEditor()
